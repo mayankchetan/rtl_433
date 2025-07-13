@@ -487,6 +487,18 @@ mappings = {
         }
     },
 
+    "rain_start": {
+        "device_type": "binary_sensor",
+        "object_suffix": "rain_start",
+        "config": {
+            "name": "Rain Sensor",
+            "device_class": "moisture",
+            "force_update": "true",
+            "payload_on": "1",
+            "payload_off": "0"
+        }
+    },
+
     "reed_open": {
         "device_type": "binary_sensor",
         "object_suffix": "reed_open",
