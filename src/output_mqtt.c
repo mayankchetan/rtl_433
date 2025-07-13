@@ -29,12 +29,17 @@ typedef struct mqtt_client {
     struct mg_connect_opts connect_opts;
     struct mg_send_mqtt_handshake_opts mqtt_opts;
     struct mg_connection *conn;
+    struct mg_connection *timer;
+    int reconnect_delay;
     int prev_status;
     char address[253 + 6 + 1]; // dns max + port
     char client_id[256];
     uint16_t message_id;
     int publish_flags; // MG_MQTT_RETAIN | MG_MQTT_QOS(0)
 } mqtt_client_t;
+
+char const *mqtt_availability_online  = "online";
+char const *mqtt_availability_offline = "offline";
 
 static void mqtt_client_event(struct mg_connection *nc, int ev, void *ev_data)
 {
@@ -53,16 +58,20 @@ static void mqtt_client_event(struct mg_connection *nc, int ev, void *ev_data)
             // Success
             print_log(LOG_NOTICE, "MQTT", "MQTT Connected...");
             mg_set_protocol_mqtt(nc);
-            if (ctx)
+            if (ctx) {
+                ctx->reconnect_delay = 0;
                 mg_send_mqtt_handshake_opt(nc, ctx->client_id, ctx->mqtt_opts);
+            }
         }
         else {
             // Error, print only once
-            if (ctx && ctx->prev_status != connect_status)
+            if (ctx && ctx->prev_status != connect_status) {
                 print_logf(LOG_WARNING, "MQTT", "MQTT connect error: %s", strerror(connect_status));
+            }
         }
-        if (ctx)
+        if (ctx) {
             ctx->prev_status = connect_status;
+        }
         break;
     }
     case MG_EV_MQTT_CONNACK:
@@ -71,6 +80,10 @@ static void mqtt_client_event(struct mg_connection *nc, int ev, void *ev_data)
         }
         else {
             print_log(LOG_NOTICE, "MQTT", "MQTT Connection established.");
+            if (ctx->mqtt_opts.will_topic) {
+                ctx->message_id++;
+                mg_mqtt_publish(ctx->conn, ctx->mqtt_opts.will_topic, ctx->message_id, MG_MQTT_QOS(0) | MG_MQTT_RETAIN, mqtt_availability_online, strlen(mqtt_availability_online));
+            }
         }
         break;
     case MG_EV_MQTT_PUBACK:
@@ -85,11 +98,38 @@ static void mqtt_client_event(struct mg_connection *nc, int ev, void *ev_data)
         break;
     }
     case MG_EV_CLOSE:
-        if (!ctx)
+        if (!ctx) {
             break; // shutting down
-        if (ctx->prev_status == 0)
+        }
+        ctx->conn = NULL;
+        if (!ctx->timer) {
+            break; // shutting down
+        }
+        if (ctx->prev_status == 0) {
             print_log(LOG_WARNING, "MQTT", "MQTT Connection lost, reconnecting...");
-        // reconnect
+        }
+        // Timer for reconnect attempt, sends us MG_EV_TIMER event
+        mg_set_timer(ctx->timer, mg_time() + ctx->reconnect_delay);
+        if (ctx->reconnect_delay < 60) {
+            // 0, 1, 3, 6, 10, 16, 25, 39, 60
+            ctx->reconnect_delay = (ctx->reconnect_delay + 1) * 3 / 2;
+        }
+        break;
+    }
+}
+
+static void mqtt_client_timer(struct mg_connection *nc, int ev, void *ev_data)
+{
+    // note that while shutting down the ctx is NULL
+    mqtt_client_t *ctx = (mqtt_client_t *)nc->user_data;
+    (void)ev_data;
+
+    //if (ev != MG_EV_POLL)
+    //    fprintf(stderr, "MQTT timer handler got event %d\n", ev);
+
+    switch (ev) {
+    case MG_EV_TIMER: {
+        // Try to reconnect
         char const *error_string = NULL;
         ctx->connect_opts.error_string = &error_string;
         ctx->conn = mg_connect_opt(nc->mgr, ctx->address, mqtt_client_event, ctx->connect_opts);
@@ -100,9 +140,10 @@ static void mqtt_client_event(struct mg_connection *nc, int ev, void *ev_data)
         }
         break;
     }
+    }
 }
 
-static mqtt_client_t *mqtt_client_init(struct mg_mgr *mgr, tls_opts_t *tls_opts, char const *host, char const *port, char const *user, char const *pass, char const *client_id, int retain, int qos)
+static mqtt_client_t *mqtt_client_init(struct mg_mgr *mgr, tls_opts_t *tls_opts, char const *host, char const *port, char const *user, char const *pass, char const *client_id, int retain, int qos, char const *availability)
 {
     mqtt_client_t *ctx = calloc(1, sizeof(*ctx));
     if (!ctx)
@@ -110,9 +151,12 @@ static mqtt_client_t *mqtt_client_init(struct mg_mgr *mgr, tls_opts_t *tls_opts,
 
     ctx->mqtt_opts.user_name = user;
     ctx->mqtt_opts.password  = pass;
+    ctx->mqtt_opts.will_topic = availability;
+    ctx->mqtt_opts.will_message = mqtt_availability_offline;
+    ctx->mqtt_opts.flags |= (availability ? MG_MQTT_WILL_RETAIN : 0);
     ctx->publish_flags  = MG_MQTT_QOS(qos) | (retain ? MG_MQTT_RETAIN : 0);
     // TODO: these should be user configurable options
-    //ctx->opts.keepalive = 60;
+    //ctx->mqtt_opts.keepalive = 60;
     //ctx->timeout = 10000L;
     //ctx->cleansession = 1;
     snprintf(ctx->client_id, sizeof(ctx->client_id), "%s", client_id);
@@ -153,6 +197,11 @@ static mqtt_client_t *mqtt_client_init(struct mg_mgr *mgr, tls_opts_t *tls_opts,
         exit(1);
 #endif
     }
+
+    // add dummy socket to receive timer events
+    struct mg_add_sock_opts opts = {.user_data = ctx};
+    ctx->timer = mg_add_sock_opt(mgr, INVALID_SOCKET, mqtt_client_timer, opts);
+
     char const *error_string = NULL;
     ctx->connect_opts.error_string = &error_string;
     ctx->conn = mg_connect_opt(mgr, ctx->address, mqtt_client_event, ctx->connect_opts);
@@ -203,6 +252,7 @@ typedef struct {
     mqtt_client_t *mqc;
     char topic[256];
     char hostname[64];
+    char *availability;
     char *devices;
     char *events;
     char *states;
@@ -450,6 +500,7 @@ static void R_API_CALLCONV data_output_mqtt_free(data_output_t *output)
     if (!mqtt)
         return;
 
+    free(mqtt->availability);
     free(mqtt->devices);
     free(mqtt->events);
     free(mqtt->states);
@@ -510,15 +561,16 @@ struct data_output *data_output_mqtt_create(struct mg_mgr *mgr, char *param, cha
     char const *base_topic = default_base_topic;
 
     // default topics
+    char const *path_availability = "availability";
     char const *path_devices = "devices[/type][/model][/subtype][/channel][/id]";
     char const *path_events = "events";
     char const *path_states = "states";
 
     // get user and pass from env vars if available.
-    char *user = getenv("MQTT_USERNAME");
-    char *pass = getenv("MQTT_PASSWORD");
-    int retain = 0;
-    int qos = 0;
+    char const *user = getenv("MQTT_USERNAME");
+    char const *pass = getenv("MQTT_PASSWORD");
+    int retain       = 0;
+    int qos          = 0;
 
     // parse host and port
     tls_opts_t tls_opts = {0};
@@ -548,6 +600,9 @@ struct data_output *data_output_mqtt_create(struct mg_mgr *mgr, char *param, cha
             qos = atoiv(val, 1);
         else if (!strcasecmp(key, "b") || !strcasecmp(key, "base"))
             base_topic = val;
+        // LWT availability status topic
+        else if (!strcasecmp(key, "a") || !strcasecmp(key, "availability"))
+            mqtt->availability = mqtt_topic_default(val, base_topic, path_availability);
         // Simple key-topic mapping
         else if (!strcasecmp(key, "d") || !strcasecmp(key, "devices"))
             mqtt->devices = mqtt_topic_default(val, base_topic, path_devices);
@@ -567,10 +622,10 @@ struct data_output *data_output_mqtt_create(struct mg_mgr *mgr, char *param, cha
         else if (!strcasecmp(key, "s") || !strcasecmp(key, "states"))
             mqtt->states = mqtt_topic_default(val, base_topic, path_states);
         // TODO: Homie Convention https://homieiot.github.io/
-        //else if (!strcasecmp(key, "o") || !strcasecmp(key, "homie"))
+        //else if (!strcasecmp(key, "homie"))
         //    mqtt->homie = mqtt_topic_default(val, NULL, "homie"); // base topic
         // TODO: Home Assistant MQTT discovery https://www.home-assistant.io/docs/mqtt/discovery/
-        //else if (!strcasecmp(key, "a") || !strcasecmp(key, "hass"))
+        //else if (!strcasecmp(key, "hass"))
         //    mqtt->hass = mqtt_topic_default(val, NULL, "homeassistant"); // discovery prefix
         else if (!tls_param(&tls_opts, key, val)) {
             // ok
@@ -587,6 +642,11 @@ struct data_output *data_output_mqtt_create(struct mg_mgr *mgr, char *param, cha
         mqtt->events  = mqtt_topic_default(NULL, base_topic, path_events);
         mqtt->states  = mqtt_topic_default(NULL, base_topic, path_states);
     }
+    if (!mqtt->availability) {
+        mqtt->availability = mqtt_topic_default(NULL, base_topic, path_availability);
+    }
+    if (mqtt->availability)
+        print_logf(LOG_NOTICE, "MQTT", "Publishing availability to MQTT topic \"%s\".", mqtt->availability);
     if (mqtt->devices)
         print_logf(LOG_NOTICE, "MQTT", "Publishing device info to MQTT topic \"%s\".", mqtt->devices);
     if (mqtt->events)
@@ -601,7 +661,7 @@ struct data_output *data_output_mqtt_create(struct mg_mgr *mgr, char *param, cha
     mqtt->output.print_int    = print_mqtt_int;
     mqtt->output.output_free  = data_output_mqtt_free;
 
-    mqtt->mqc = mqtt_client_init(mgr, &tls_opts, host, port, user, pass, client_id, retain, qos);
+    mqtt->mqc = mqtt_client_init(mgr, &tls_opts, host, port, user, pass, client_id, retain, qos, mqtt->availability);
 
     return (struct data_output *)mqtt;
 }

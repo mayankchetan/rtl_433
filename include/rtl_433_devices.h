@@ -271,6 +271,23 @@
     DECL(geevon) \
     DECL(fineoffset_wh46) \
     DECL(vevor_7in1) \
+    DECL(arexx_ml) \
+    DECL(rosstech_dcu706) \
+    DECL(risco_agility) \
+    DECL(thermopro_tp828b) \
+    DECL(bresser_st1005h) \
+    DECL(deltadore_x3d) \
+    DECL(quinetic) \
+    DECL(gridstream96) \
+    DECL(gridstream192) \
+    DECL(gridstream384) \
+    DECL(revolt_zx7717) \
+    DECL(tpms_gm) \
+    DECL(rainpoint_hcs012arf) \
+    DECL(apator_metra_erm30) \
+    DECL(thermopro_tx7b) \
+    DECL(nexus_sauna) \
+    DECL(homelead_hg9901) \
 
     /* Add new decoders here. */
 
